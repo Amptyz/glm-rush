@@ -77,6 +77,17 @@
     let recoveryAttempts = 0;
     let _shadowRef = null;
 
+    // ── Token 农场 ──────────────────────────────
+    let ticketQueue = [];
+    let harvestMode = false;
+    try {
+        const saved = sessionStorage.getItem('glm_rush_tickets');
+        if (saved) ticketQueue = JSON.parse(saved);
+    } catch {}
+    function saveTickets() {
+        try { sessionStorage.setItem('glm_rush_tickets', JSON.stringify(ticketQueue)); } catch {}
+    }
+
     // ═══════════════════════════════════════════
     //  工具
     // ═══════════════════════════════════════════
@@ -142,8 +153,19 @@
     const _fetch = window.fetch;
     let _retryLock = null;
 
-    async function singleAttempt(url, opts, attemptNum) {
+    async function singleAttempt(url, opts, attemptNum, ticketOverride) {
         try {
+            // 替换 ticket（Token 农场）
+            let patchedBody = opts.body;
+            if (ticketOverride && opts.body) {
+                try {
+                    const bObj = JSON.parse(opts.body);
+                    if ('ticket' in bObj) {
+                        patchedBody = JSON.stringify({ ...bObj, ticket: ticketOverride });
+                    }
+                } catch {}
+            }
+
             // 请求指纹随机化 — 每次请求看起来不一样，降低被识别为脚本的概率
             const randHeaders = { ...opts.headers };
             randHeaders['X-Request-Id'] = Math.random().toString(36).slice(2, 15);
@@ -152,7 +174,7 @@
             const q = (0.5 + Math.random() * 0.5).toFixed(1);
             randHeaders['Accept-Language'] = `zh-CN,zh;q=${q},en;q=${(q * 0.7).toFixed(1)}`;
 
-            const resp = await _fetch(url, { ...opts, headers: randHeaders, credentials: 'include' });
+            const resp = await _fetch(url, { ...opts, body: patchedBody, headers: randHeaders, credentials: 'include' });
 
             // HTTP 状态码检测
             if (resp.status === 401 || resp.status === 403) {
@@ -225,12 +247,28 @@
                 const controllers = [];
                 const promises = [];
 
+                // Token 农场: 每批次换一个 ticket
+                let batchTicket = null;
+                if (ticketQueue.length > 0) {
+                    batchTicket = ticketQueue.shift();
+                    saveTickets();
+                    refreshUI();
+                    log(`ticket 切换 (剩余 ${ticketQueue.length})`);
+                } else if (ticketQueue.length === 0 && opts.body) {
+                    try {
+                        const bObj = JSON.parse(opts.body);
+                        if ('ticket' in bObj && totalAttempt > 1) {
+                            log('ticket 队列已空! 请切换到收割模式补充票据', 'warn');
+                        }
+                    } catch {}
+                }
+
                 for (let j = 0; j < batchSize; j++) {
                     totalAttempt++;
                     const ac = new AbortController();
                     controllers.push(ac);
                     promises.push(
-                        singleAttempt(url, { ...opts, signal: ac.signal }, totalAttempt)
+                        singleAttempt(url, { ...opts, signal: ac.signal }, totalAttempt, batchTicket)
                     );
                 }
 
@@ -363,6 +401,24 @@
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
 
+            // 收割模式: 提取 ticket 存队列，不发真实请求
+            if (harvestMode) {
+                try {
+                    const bObj = JSON.parse(captured.body);
+                    if (bObj.ticket) {
+                        ticketQueue.push(bObj.ticket);
+                        saveTickets();
+                        refreshUI();
+                        log(`✅ 收割 ticket 成功 (共 ${ticketQueue.length} 张)`);
+                    } else {
+                        log('未找到 ticket 字段', 'warn');
+                    }
+                } catch { log('收割失败: body 解析错误', 'warn'); }
+                return new Response('{"code":200,"msg":"harvest","data":{"bizId":"harvest-ok"}}', {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                });
+            }
+
             // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
                 log('已抢到, 返回成功响应');
@@ -433,6 +489,23 @@
             const captured = { url, method: this._m, body, headers: this._h || {} };
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
+
+            // 收割模式: 提取 ticket 存队列，不发真实请求
+            if (harvestMode) {
+                try {
+                    const bObj = JSON.parse(body);
+                    if (bObj.ticket) {
+                        ticketQueue.push(bObj.ticket);
+                        saveTickets();
+                        refreshUI();
+                        log(`✅ 收割 ticket 成功 (共 ${ticketQueue.length} 张)`);
+                    } else {
+                        log('未找到 ticket 字段', 'warn');
+                    }
+                } catch { log('收割失败: body 解析错误', 'warn'); }
+                fakeXHR(self, '{"code":200,"msg":"harvest","data":{"bizId":"harvest-ok"}}');
+                return;
+            }
 
             // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
@@ -914,6 +987,9 @@
 .b-stop{background:#d63031}
 .b-heat{background:#fdcb6e;color:#2d3436}
 .b-time{background:#6c5ce7;flex:0 0 auto!important;padding:4px 10px!important}
+.b-harvest{background:#a29bfe;color:#1a1a2e;flex:0 0 auto!important;padding:4px 10px!important}
+.b-harvest.on{background:#fd79a8;color:#fff}
+.b-clrtk{background:#636e72;flex:0 0 auto!important;padding:4px 10px!important}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;font-size:11px;text-align:center}
 .stats div{background:#2d3436;border-radius:4px;padding:4px}
 .stats .v{font-size:16px;font-weight:700;color:#74b9ff}
@@ -944,6 +1020,13 @@
       <button class="b-time" id="b-time">设定</button>
       <span id="timer-info" style="color:#6c5ce7;font-size:11px"></span>
     </div>
+    <div class="row">
+      <span style="color:#a29bfe">🎫 票据</span>
+      <span class="v" id="tk-cnt" style="font-size:14px;font-weight:700;color:#a29bfe">${ticketQueue.length}</span>
+      <span style="color:#a29bfe">张</span>
+      <button class="b-harvest" id="b-harvest">收割模式</button>
+      <button class="b-clrtk" id="b-clrtk">清空</button>
+    </div>
     <div class="btns">
       <button class="b-go" id="b-go">▶ 主动抢购</button>
       <button class="b-stop" id="b-stop" style="display:none">■ 停止</button>
@@ -961,6 +1044,18 @@
         $('b-stop').onclick = stopAll;
         $('b-heat').onclick = preheat;
         $('b-time').onclick = () => { const v = $('i-time').value; if (v) scheduleAt(v); };
+        $('b-harvest').onclick = function() {
+            harvestMode = !harvestMode;
+            this.classList.toggle('on', harvestMode);
+            this.textContent = harvestMode ? '⏹ 停止收割' : '收割模式';
+            log(harvestMode ? '🌾 收割模式开启 — 点击购买按钮开始收割 ticket' : '收割模式已关闭');
+        };
+        $('b-clrtk').onclick = () => {
+            ticketQueue = [];
+            saveTickets();
+            refreshUI();
+            log('票据队列已清空');
+        };
         $('i-conc').onchange = function() { CFG.concurrency = Math.max(1, +this.value || 5); saveCfg(CFG); };
         $('i-turbo').onchange = function() { CFG.turboConcurrency = Math.max(1, +this.value || 10); saveCfg(CFG); };
         $('i-max').onchange = function() { CFG.maxRetry = Math.max(10, +this.value || 2000); saveCfg(CFG); };
@@ -1036,6 +1131,7 @@
             const cntEl = $('s-cnt'); if (cntEl) cntEl.textContent = state.count;
             const okEl = $('s-ok'); if (okEl) okEl.textContent = state.stats.success;
             const errEl = $('s-err'); if (errEl) errEl.textContent = state.stats.errors;
+            const tkEl = $('tk-cnt'); if (tkEl) tkEl.textContent = ticketQueue.length;
 
             const goBtn = $('b-go');
             const stopBtn = $('b-stop');
